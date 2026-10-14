@@ -28,6 +28,8 @@ Route::post('/game/mobile-legends/check', [MobileLegendsController::class, 'chec
     ->middleware('throttle:20,1');
 Route::post('/payments/pakasir/create', [PakasirController::class, 'create'])
     ->middleware('throttle:10,1');
+Route::get('/payments/pakasir/{orderId}', [PakasirController::class, 'show'])
+    ->middleware('throttle:20,1');
 Route::post('/payments/pakasir/webhook', [PakasirController::class, 'webhook'])
     ->middleware('throttle:60,1');
 

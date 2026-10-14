@@ -105,10 +105,11 @@ class PakasirController extends Controller
 
         $redirectUrl = (string) config('services.pakasir.redirect_url');
         if ($paymentUrl !== '' && $redirectUrl !== '') {
-            $redirectUrl .= (str_contains($redirectUrl, '?') ? '&' : '?').'order_id='.rawurlencode($orderId);
+            $redirectUrl = rtrim($redirectUrl, '/').'/'.rawurlencode($orderId);
             $paymentUrl .= (str_contains($paymentUrl, '?') ? '&' : '?').http_build_query([
                 'redirect' => $redirectUrl,
             ]);
+            $payload['payment_link'] = $paymentUrl;
         }
 
         $transaction->update([
@@ -139,6 +140,81 @@ class PakasirController extends Controller
         ], 201);
     }
 
+    public function show(Request $request, string $orderId): JsonResponse
+    {
+        $transaction = PakasirTransaction::query()->where('order_id', $orderId)->first();
+
+        if (! $transaction || $transaction->txn_id === null) {
+            return response()->json(['message' => 'Invoice tidak ditemukan.'], 404);
+        }
+
+        if ($request->boolean('refresh') && $transaction->status === 'pending') {
+            $slug = (string) config('services.pakasir.slug');
+            $apiKey = (string) config('services.pakasir.api_key');
+
+            if ($slug !== '' && $apiKey !== '') {
+                try {
+                    $response = Http::acceptJson()
+                        ->withHeader('X-Api-Key', $apiKey)
+                        ->timeout(10)
+                        ->get(sprintf(
+                            '%s/api/v2/transaction-status/%s/%s',
+                            rtrim((string) config('services.pakasir.base_url'), '/'),
+                            rawurlencode($slug),
+                            rawurlencode($transaction->txn_id),
+                        ));
+
+                    $status = $response->json();
+                    if ($response->successful()
+                        && is_array($status)
+                        && ($status['txn_id'] ?? null) === $transaction->txn_id
+                        && ($status['order_id'] ?? null) === $transaction->order_id
+                        && (int) ($status['amount'] ?? 0) === $transaction->amount
+                        && filter_var($status['is_sandbox'] ?? null, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) === $transaction->is_sandbox
+                        && in_array($status['status'] ?? null, ['pending', 'completed', 'canceled'], true)
+                        && $status['status'] !== $transaction->status) {
+                        $transaction->update([
+                            'status' => $status['status'],
+                            'completed_at' => $status['status'] === 'completed'
+                                ? ($status['completed_at'] ?? now())
+                                : null,
+                        ]);
+                        $this->syncOrderPaymentStatus($transaction, $status['status']);
+                    }
+                } catch (ConnectionException) {
+                    // Invoice lokal tetap dapat dibuka saat Pakasir tidak terjangkau.
+                }
+            }
+        }
+
+        $payload = $transaction->provider_payload ?? [];
+        $customer = $transaction->customer_data ?? [];
+
+        return response()->json([
+            'data' => [
+                'order_id' => $transaction->order_id,
+                'txn_id' => $transaction->txn_id,
+                'order_type' => $transaction->order_type,
+                'description' => $transaction->description,
+                'amount' => $transaction->amount,
+                'fee' => (int) ($payload['fee'] ?? 0),
+                'total_payment' => (int) ($payload['total_payment'] ?? $transaction->amount),
+                'payment_method' => $transaction->payment_method,
+                'status' => $transaction->status,
+                'created_at' => $transaction->created_at?->toISOString(),
+                'expired_at' => $payload['expired_at'] ?? null,
+                'qr_string' => $payload['qr_string'] ?? null,
+                'va_number' => $payload['va_number'] ?? null,
+                'payment_url' => $payload['payment_link'] ?? null,
+                'is_sandbox' => $transaction->is_sandbox,
+                'game_name' => $customer['game_name'] ?? null,
+                'game_user_id' => $customer['user_id'] ?? null,
+                'game_server_id' => $customer['server_id'] ?? null,
+                'quantity' => $customer['quantity'] ?? null,
+            ],
+        ]);
+    }
+
     public function webhook(Request $request): JsonResponse
     {
         $secret = (string) config('services.pakasir.webhook_secret');
@@ -167,12 +243,16 @@ class PakasirController extends Controller
             return response()->json(['message' => 'Data transaksi tidak cocok.'], 422);
         }
 
+        if ($transaction->status === 'completed' && $data['status'] !== 'completed') {
+            return response()->json(['message' => 'Status pembayaran sudah selesai.']);
+        }
+
         $transaction->update([
             'status' => $data['status'],
             'completed_at' => $data['status'] === 'completed'
                 ? ($data['completed_at'] ?? now())
                 : null,
-            'provider_payload' => $data,
+            'provider_payload' => array_merge($transaction->provider_payload ?? [], ['webhook' => $data]),
         ]);
         $this->syncOrderPaymentStatus($transaction, $data['status']);
 
@@ -259,18 +339,18 @@ class PakasirController extends Controller
 
         $payload = $state->payload ?? [];
         $paid = $paymentStatus === 'completed';
-        $payload['orders'] = collect($payload['orders'] ?? [])->map(function (array $order) use ($transaction, $paid): array {
+        $payload['orders'] = collect($payload['orders'] ?? [])->map(function (array $order) use ($transaction, $paymentStatus, $paid): array {
             if (($order['id'] ?? null) !== $transaction->order_id) return $order;
             return [
                 ...$order,
-                'paymentStatus' => $paid ? 'paid' : 'failed',
+                'paymentStatus' => $paymentStatus === 'pending' ? 'pending' : ($paid ? 'paid' : 'failed'),
                 'status' => $paid ? 'waiting_assignment' : 'waiting_payment',
                 'updatedAt' => now()->toISOString(),
             ];
         })->values()->all();
-        $payload['payments'] = collect($payload['payments'] ?? [])->map(function (array $payment) use ($transaction, $paid): array {
+        $payload['payments'] = collect($payload['payments'] ?? [])->map(function (array $payment) use ($transaction, $paymentStatus, $paid): array {
             if (($payment['orderId'] ?? null) !== $transaction->order_id) return $payment;
-            return [...$payment, 'status' => $paid ? 'paid' : 'failed'];
+            return [...$payment, 'status' => $paymentStatus === 'pending' ? 'pending' : ($paid ? 'paid' : 'failed')];
         })->values()->all();
         $state->payload = $payload;
         $state->save();
