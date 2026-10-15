@@ -9,35 +9,47 @@ use App\Http\Controllers\Api\UploadController;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('auth')->group(function (): void {
-    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
-    Route::post('/register', [AuthController::class, 'register'])->middleware('throttle:5,1');
-    Route::middleware('jwt.auth')->group(function (): void {
+    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:auth-login');
+    Route::post('/register', [AuthController::class, 'register'])->middleware('throttle:auth-register');
+    Route::middleware(['jwt.auth', 'throttle:account'])->group(function (): void {
         Route::get('/me', [AuthController::class, 'me']);
         Route::patch('/profile', [AuthController::class, 'updateProfile']);
+        Route::get('/profile-extras', [AuthController::class, 'profileExtras']);
+        Route::put('/profile-extras', [AuthController::class, 'updateProfileExtras']);
+        Route::get('/data', [AdminStateController::class, 'customerData']);
         Route::put('/password', [AuthController::class, 'changePassword']);
         Route::delete('/account', [AuthController::class, 'destroy']);
         Route::post('/logout', [AuthController::class, 'logout']);
     });
 });
 
-Route::get('/store/state', [AdminStateController::class, 'publicState']);
-Route::get('/orders/{orderId}', [AdminStateController::class, 'publicOrder'])->middleware('throttle:30,1');
+Route::get('/store/state', [AdminStateController::class, 'publicState'])->middleware('throttle:public-api');
+Route::get('/orders/{orderId}', [AdminStateController::class, 'publicOrder'])
+    ->where('orderId', '[A-Za-z0-9-]{1,100}')
+    ->middleware('throttle:invoice');
+Route::get('/store/orders/recent', [AdminStateController::class, 'recentOrders'])->middleware('throttle:public-api');
 Route::get('/products/mobile-legends', [DigiflazzProductController::class, 'mobileLegends'])
-    ->middleware('throttle:30,1');
+    ->middleware('throttle:public-api');
 Route::post('/game/mobile-legends/check', [MobileLegendsController::class, 'check'])
-    ->middleware('throttle:20,1');
+    ->middleware('throttle:account-check');
 Route::post('/payments/pakasir/create', [PakasirController::class, 'create'])
-    ->middleware('throttle:10,1');
+    ->middleware('throttle:payment-create');
+Route::post('/payments/pakasir/{orderId}/simulate', [PakasirController::class, 'simulate'])
+    ->where('orderId', '[A-Za-z0-9-]{1,100}')
+    ->middleware('throttle:payment-create');
 Route::get('/payments/pakasir/{orderId}', [PakasirController::class, 'show'])
-    ->middleware('throttle:20,1');
+    ->where('orderId', '[A-Za-z0-9-]{1,100}')
+    ->middleware('throttle:invoice');
 Route::post('/payments/pakasir/webhook', [PakasirController::class, 'webhook'])
-    ->middleware('throttle:60,1');
+    ->middleware('throttle:webhook');
 
-Route::prefix('admin')->middleware(['jwt.auth', 'admin'])->group(function (): void {
+Route::prefix('admin')->middleware(['jwt.auth', 'admin', 'throttle:admin-api'])->group(function (): void {
     Route::post('/digiflazz/sync', [DigiflazzProductController::class, 'sync'])
         ->middleware('throttle:10,1');
-    Route::post('/uploads', [UploadController::class, 'store']);
+    Route::post('/uploads', [UploadController::class, 'store'])->middleware('throttle:10,1');
     Route::get('/state', [AdminStateController::class, 'show']);
+    Route::get('/operations', [AdminStateController::class, 'operations']);
     Route::get('/customers', [AdminStateController::class, 'customers']);
-    Route::put('/state', [AdminStateController::class, 'update']);
+    Route::put('/state', [AdminStateController::class, 'update'])->middleware('throttle:10,1');
+    Route::put('/operations', [AdminStateController::class, 'updateOperations'])->middleware('throttle:10,1');
 });

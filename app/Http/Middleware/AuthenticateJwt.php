@@ -17,7 +17,7 @@ class AuthenticateJwt
     public function handle(Request $request, Closure $next): Response|JsonResponse
     {
         try {
-            $token = $request->bearerToken();
+            $token = $request->bearerToken() ?: $request->cookie((string) config('jwt.cookie'));
             if (!$token) {
                 throw new AuthenticationException('Token tidak ditemukan.');
             }

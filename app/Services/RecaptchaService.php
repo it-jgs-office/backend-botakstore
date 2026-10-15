@@ -11,11 +11,9 @@ class RecaptchaService
     {
         $secret = (string) config('services.recaptcha.secret_key', '');
 
-        // Bypass saat secret belum dikonfigurasi (mis. testing lokal) agar
-        // alur auth tidak terkunci. Di production secret wajib diisi.
         if ($secret === '') {
-            Log::warning('RECAPTCHA_SECRET_KEY belum dikonfigurasi, verifikasi dilewati.');
-            return true;
+            Log::error('RECAPTCHA_SECRET_KEY belum dikonfigurasi. Login dan pendaftaran ditolak.');
+            return false;
         }
 
         if ($token === '') {

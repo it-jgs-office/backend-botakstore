@@ -19,7 +19,7 @@ class DigiflazzProductController extends Controller
 
         try {
             $products = $this->fetchProducts();
-            Cache::put($this->cacheKey(), $products, now()->addHour());
+            Cache::put($this->cacheKey(), $products, now()->addMinutes(10));
             Cache::forget($this->cooldownKey());
         } catch (ConnectionException|RuntimeException $exception) {
             return $this->errorResponse($exception);
@@ -41,7 +41,7 @@ class DigiflazzProductController extends Controller
 
         try {
             $products = $this->fetchProducts();
-            Cache::put($this->cacheKey(), $products, now()->addHour());
+            Cache::put($this->cacheKey(), $products, now()->addMinutes(10));
             Cache::forget($this->cooldownKey());
         } catch (ConnectionException|RuntimeException $exception) {
             return $this->errorResponse($exception);

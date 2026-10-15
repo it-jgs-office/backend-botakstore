@@ -9,6 +9,7 @@ use App\Services\RecaptchaService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Cookie;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -72,7 +73,8 @@ class AuthController extends Controller
 
     public function logout(): JsonResponse
     {
-        return response()->json(['message' => 'Berhasil keluar.']);
+        return response()->json(['message' => 'Berhasil keluar.'])
+            ->withCookie(Cookie::forget((string) config('jwt.cookie'), '/api'));
     }
 
     public function updateProfile(Request $request): JsonResponse
@@ -84,6 +86,36 @@ class AuthController extends Controller
         $request->user()->update($data);
 
         return response()->json(['user' => $this->userPayload($request->user()->fresh())]);
+    }
+
+    public function profileExtras(Request $request): JsonResponse
+    {
+        return response()->json([
+            'data' => array_merge([
+                'avatar' => null,
+                'gameNickname' => '',
+                'gameUserId' => '',
+                'gameServerId' => '',
+                'notifOrder' => true,
+                'notifPromo' => true,
+            ], $request->user()->profile_extras ?? []),
+        ]);
+    }
+
+    public function updateProfileExtras(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'avatar' => ['nullable', 'string', 'max:2000000'],
+            'gameNickname' => ['nullable', 'string', 'max:100'],
+            'gameUserId' => ['nullable', 'string', 'max:100'],
+            'gameServerId' => ['nullable', 'string', 'max:50'],
+            'notifOrder' => ['required', 'boolean'],
+            'notifPromo' => ['required', 'boolean'],
+        ]);
+
+        $request->user()->update(['profile_extras' => $data]);
+
+        return response()->json(['data' => $data]);
     }
 
     public function changePassword(Request $request): JsonResponse
@@ -128,11 +160,20 @@ class AuthController extends Controller
         $issued = $this->jwt->issue($user);
 
         return response()->json([
-            'access_token' => $issued['token'],
             'token_type' => 'Bearer',
             'expires_in' => $issued['expires_in'],
             'user' => $this->userPayload($user),
-        ], $status);
+        ], $status)->withCookie(cookie(
+            (string) config('jwt.cookie'),
+            $issued['token'],
+            max(1, (int) ceil($issued['expires_in'] / 60)),
+            '/api',
+            null,
+            (bool) config('jwt.cookie_secure'),
+            true,
+            false,
+            (string) config('jwt.cookie_same_site'),
+        ));
     }
 
     private function userPayload(User $user): array

@@ -5,21 +5,32 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\PakasirTransaction;
 use App\Models\StoreState;
+use App\Models\StoreOperationState;
+use App\Models\User;
+use App\Services\JwtService;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class PakasirController extends Controller
 {
+    public function __construct(private readonly JwtService $jwt) {}
+
     public function create(Request $request): JsonResponse
     {
         $data = $request->validate([
             'order_type' => ['required', 'in:topup,joki'],
             'item_id' => ['required', 'string', 'max:100'],
-            'description' => ['required', 'string', 'max:255'],
-            'amount' => ['required', 'integer', 'min:500', 'max:50000000'],
+            // Harga, nama produk, dan game selalu ditentukan ulang dari katalog server.
+            // Field ini dipertahankan agar klien lama tetap kompatibel, tetapi tidak dipercaya.
+            'description' => ['nullable', 'string', 'max:255'],
+            'amount' => ['nullable', 'integer', 'min:0', 'max:50000000'],
+            'coupon_code' => ['nullable', 'string', 'max:32'],
             'payment_method' => ['required', 'in:payment_link,qris,bri_va,bni_va,cimb_niaga_va,danamon_va,maybank_va,bnc_va,bsi_va,muamalat_va,ocbc_va'],
             'customer' => ['required', 'array'],
             'customer.whatsapp' => ['required', 'string', 'max:30'],
@@ -41,11 +52,45 @@ class PakasirController extends Controller
             'customer.game_name' => ['nullable', 'string', 'max:150'],
         ]);
 
+        if (filled($data['customer']['password'] ?? null)) {
+            $data['customer']['password'] = Crypt::encryptString((string) $data['customer']['password']);
+        }
+
         $slug = (string) config('services.pakasir.slug');
         $apiKey = (string) config('services.pakasir.api_key');
         if ($slug === '' || $apiKey === '') {
             return response()->json(['message' => 'Konfigurasi Pakasir belum lengkap.'], 503);
         }
+
+        $catalog = StoreState::query()->where('key', 'botakstore')->first();
+        $catalogPayload = $catalog?->payload ?? [];
+        if (($catalogPayload['settings']['maintenance'] ?? false) === true) {
+            return response()->json(['message' => 'Toko sedang dalam pemeliharaan. Transaksi baru sementara ditutup.'], 503);
+        }
+
+        $resolvedOrder = $this->resolveOrder($data, $catalogPayload);
+        $data['item_id'] = $resolvedOrder['item_id'];
+        $data['description'] = $resolvedOrder['description'];
+        $data['customer']['game_id'] = $resolvedOrder['game_id'];
+        $data['customer']['game_name'] = $resolvedOrder['game_name'];
+        $baseAmount = $resolvedOrder['amount'];
+
+        // Jangan pernah memakai customer_id dari browser. Bila pembeli masuk,
+        // identitas pesanan diikat ke sesi JWT; pembelian tamu memakai ID anonim.
+        if ($user = $this->optionalAuthenticatedUser($request)) {
+            $data['customer']['customer_id'] = 'api-'.$user->id;
+            $data['customer']['customer_name'] = $data['customer']['customer_name'] ?? $user->name;
+        } else {
+            unset($data['customer']['customer_id']);
+        }
+
+        [$amount, $discount, $couponCode] = $this->couponAmount(
+            $baseAmount,
+            (string) ($data['coupon_code'] ?? ''),
+        );
+        $data['customer']['coupon_code'] = $couponCode;
+        $data['customer']['coupon_discount'] = $discount;
+        $data['customer']['coupon_base_amount'] = $baseAmount;
 
         $orderId = sprintf(
             'BS-%s-%s-%s',
@@ -59,7 +104,7 @@ class PakasirController extends Controller
             'order_type' => $data['order_type'],
             'item_id' => $data['item_id'],
             'description' => $data['description'],
-            'amount' => $data['amount'],
+            'amount' => $amount,
             'payment_method' => $data['payment_method'],
             'status' => 'pending',
             'is_sandbox' => filter_var(config('services.pakasir.sandbox'), FILTER_VALIDATE_BOOL),
@@ -78,7 +123,7 @@ class PakasirController extends Controller
                     rawurlencode($orderId),
                 ), [
                     'method' => $data['payment_method'],
-                    'amount' => $data['amount'],
+                    'amount' => $amount,
                 ]);
         } catch (ConnectionException) {
             $transaction->update(['status' => 'failed']);
@@ -120,17 +165,23 @@ class PakasirController extends Controller
             $data,
             $orderId,
             $txnId,
-            (int) ($payload['total_payment'] ?? $data['amount']),
+            (int) ($payload['total_payment'] ?? $amount),
+            $baseAmount,
+            $discount,
+            $couponCode,
         );
 
         return response()->json([
             'data' => [
                 'order_id' => $orderId,
                 'txn_id' => $txnId,
-                'amount' => $data['amount'],
+                'amount' => $amount,
+                'base_amount' => $baseAmount,
+                'discount' => $discount,
+                'coupon_code' => $couponCode,
                 'payment_method' => $data['payment_method'],
                 'fee' => (int) ($payload['fee'] ?? 0),
-                'total_payment' => (int) ($payload['total_payment'] ?? $data['amount']),
+                'total_payment' => (int) ($payload['total_payment'] ?? $amount),
                 'expired_at' => $payload['expired_at'] ?? null,
                 'qr_string' => $qrString !== '' ? $qrString : null,
                 'va_number' => $vaNumber !== '' ? $vaNumber : null,
@@ -197,6 +248,9 @@ class PakasirController extends Controller
                 'order_type' => $transaction->order_type,
                 'description' => $transaction->description,
                 'amount' => $transaction->amount,
+                'base_amount' => (int) ($customer['coupon_base_amount'] ?? $transaction->amount),
+                'discount' => (int) ($customer['coupon_discount'] ?? 0),
+                'coupon_code' => $customer['coupon_code'] ?? null,
                 'fee' => (int) ($payload['fee'] ?? 0),
                 'total_payment' => (int) ($payload['total_payment'] ?? $transaction->amount),
                 'payment_method' => $transaction->payment_method,
@@ -259,7 +313,43 @@ class PakasirController extends Controller
         return response()->json(['message' => 'Webhook diterima.']);
     }
 
-    private function storePendingOrder(array $data, string $orderId, string $transactionId, int $totalPayment): void
+    public function simulate(string $orderId): JsonResponse
+    {
+        if (! app()->environment(['local', 'testing'])) {
+            abort(404);
+        }
+
+        $transaction = PakasirTransaction::query()->where('order_id', $orderId)->first();
+
+        if (! $transaction) {
+            return response()->json(['message' => 'Invoice tidak ditemukan.'], 404);
+        }
+
+        if (! $transaction->is_sandbox) {
+            return response()->json(['message' => 'Simulasi hanya tersedia pada mode uji coba.'], 403);
+        }
+
+        if ($transaction->status === 'completed') {
+            return response()->json(['message' => 'Pembayaran sudah berhasil disimulasikan.']);
+        }
+
+        if ($transaction->status !== 'pending') {
+            return response()->json(['message' => 'Invoice ini sudah tidak dapat disimulasikan.'], 422);
+        }
+
+        $transaction->update([
+            'status' => 'completed',
+            'completed_at' => now(),
+            'provider_payload' => array_merge($transaction->provider_payload ?? [], [
+                'simulation' => ['status' => 'completed', 'at' => now()->toISOString()],
+            ]),
+        ]);
+        $this->syncOrderPaymentStatus($transaction, 'completed');
+
+        return response()->json(['message' => 'Pembayaran uji coba berhasil disimulasikan.']);
+    }
+
+    private function storePendingOrder(array $data, string $orderId, string $transactionId, int $totalPayment, int $baseAmount, int $discount, ?string $couponCode): void
     {
         $customer = $data['customer'];
         $paymentMethod = $data['payment_method'] === 'qris'
@@ -268,14 +358,22 @@ class PakasirController extends Controller
         $customerId = (string) ($customer['customer_id'] ?? 'guest-'.substr(sha1(($customer['email'] ?? '').($customer['whatsapp'] ?? '')), 0, 12));
         $customerName = (string) ($customer['customer_name'] ?? $customer['username'] ?? $customer['nickname'] ?? 'Pelanggan');
         $now = now()->toISOString();
-        $state = StoreState::query()->where('key', 'botakstore')->first();
-        $payload = $state?->payload ?? [];
-        $orders = is_array($payload['orders'] ?? null) ? $payload['orders'] : [];
-        $payments = is_array($payload['payments'] ?? null) ? $payload['payments'] : [];
-        $logs = is_array($payload['logs'] ?? null) ? $payload['logs'] : [];
+        DB::transaction(function () use ($data, $orderId, $transactionId, $totalPayment, $baseAmount, $discount, $couponCode, $customer, $paymentMethod, $customerId, $customerName, $now): void {
+            $state = StoreOperationState::query()
+                ->lockForUpdate()
+                ->where('key', 'botakstore')
+                ->first();
+            if (! $state) {
+                $state = StoreOperationState::query()->create(['key' => 'botakstore', 'payload' => []]);
+            }
 
-        if (! collect($orders)->contains(fn (array $order): bool => ($order['id'] ?? null) === $orderId)) {
-            array_unshift($orders, [
+            $payload = $state->payload ?? [];
+            $orders = is_array($payload['orders'] ?? null) ? $payload['orders'] : [];
+            $payments = is_array($payload['payments'] ?? null) ? $payload['payments'] : [];
+            $logs = is_array($payload['logs'] ?? null) ? $payload['logs'] : [];
+
+            if (! collect($orders)->contains(fn (array $order): bool => ($order['id'] ?? null) === $orderId)) {
+                array_unshift($orders, [
                 'id' => $orderId,
                 'invoice' => $orderId,
                 'customerId' => $customerId,
@@ -296,9 +394,10 @@ class PakasirController extends Controller
                     'notes' => $customer['note'] ?? null,
                 ],
                 'price' => [
-                    'base' => $totalPayment,
+                    'base' => $baseAmount,
                     'addons' => [],
-                    'discount' => 0,
+                    'discount' => $discount,
+                    'couponCode' => $couponCode,
                     'total' => $totalPayment,
                 ],
                 'paymentMethod' => $paymentMethod,
@@ -308,7 +407,7 @@ class PakasirController extends Controller
                 'createdAt' => $now,
                 'updatedAt' => $now,
             ]);
-            array_unshift($payments, [
+                array_unshift($payments, [
                 'id' => $transactionId,
                 'orderId' => $orderId,
                 'method' => $paymentMethod,
@@ -316,7 +415,7 @@ class PakasirController extends Controller
                 'status' => 'pending',
                 'createdAt' => $now,
             ]);
-            array_unshift($logs, [
+                array_unshift($logs, [
                 'id' => 'log-'.$orderId,
                 'orderId' => $orderId,
                 'status' => 'waiting_payment',
@@ -324,35 +423,184 @@ class PakasirController extends Controller
                 'by' => 'system',
                 'createdAt' => $now,
             ]);
-        }
+            }
 
-        $payload['orders'] = $orders;
-        $payload['payments'] = $payments;
-        $payload['logs'] = $logs;
-        StoreState::query()->updateOrCreate(['key' => 'botakstore'], ['payload' => $payload]);
+            $payload['orders'] = $orders;
+            $payload['payments'] = $payments;
+            $payload['logs'] = $logs;
+            $state->payload = $payload;
+            $state->save();
+        });
     }
 
     private function syncOrderPaymentStatus(PakasirTransaction $transaction, string $paymentStatus): void
     {
-        $state = StoreState::query()->where('key', 'botakstore')->first();
-        if (! $state) return;
-
-        $payload = $state->payload ?? [];
         $paid = $paymentStatus === 'completed';
-        $payload['orders'] = collect($payload['orders'] ?? [])->map(function (array $order) use ($transaction, $paymentStatus, $paid): array {
+        DB::transaction(function () use ($transaction, $paymentStatus, $paid): void {
+            $state = StoreOperationState::query()
+                ->lockForUpdate()
+                ->where('key', 'botakstore')
+                ->first();
+            if (! $state) return;
+
+            $payload = $state->payload ?? [];
+            $payload['orders'] = collect($payload['orders'] ?? [])->map(function (array $order) use ($transaction, $paymentStatus, $paid): array {
             if (($order['id'] ?? null) !== $transaction->order_id) return $order;
             return [
                 ...$order,
                 'paymentStatus' => $paymentStatus === 'pending' ? 'pending' : ($paid ? 'paid' : 'failed'),
-                'status' => $paid ? 'waiting_assignment' : 'waiting_payment',
+                'status' => $paid ? 'in_progress' : 'waiting_payment',
                 'updatedAt' => now()->toISOString(),
             ];
-        })->values()->all();
-        $payload['payments'] = collect($payload['payments'] ?? [])->map(function (array $payment) use ($transaction, $paymentStatus, $paid): array {
+            })->values()->all();
+            $payload['payments'] = collect($payload['payments'] ?? [])->map(function (array $payment) use ($transaction, $paymentStatus, $paid): array {
             if (($payment['orderId'] ?? null) !== $transaction->order_id) return $payment;
             return [...$payment, 'status' => $paymentStatus === 'pending' ? 'pending' : ($paid ? 'paid' : 'failed')];
-        })->values()->all();
-        $state->payload = $payload;
-        $state->save();
+            })->values()->all();
+            $state->payload = $payload;
+            $state->save();
+        });
+
+        if ($paid) $this->redeemCoupon($transaction);
+    }
+
+    private function couponAmount(int $subtotal, string $rawCode): array
+    {
+        $code = strtoupper(trim($rawCode));
+        if ($code === '') return [$subtotal, 0, null];
+
+        $state = StoreState::query()->where('key', 'botakstore')->first();
+        $payload = $state?->payload ?? [];
+        $coupon = collect($payload['coupons'] ?? [])->first(
+            fn (array $item): bool => strtoupper((string) ($item['code'] ?? '')) === $code,
+        );
+        if (! $coupon || ! ($coupon['active'] ?? false)) abort(422, 'Kode voucher tidak ditemukan atau tidak aktif.');
+        if ((int) ($coupon['used'] ?? 0) >= (int) ($coupon['quota'] ?? 0)) abort(422, 'Kuota voucher sudah habis.');
+        if (strtotime((string) ($coupon['expiresAt'] ?? '')) < now()->startOfDay()->timestamp) abort(422, 'Voucher sudah kedaluwarsa.');
+        if ($subtotal < (int) ($coupon['minOrder'] ?? 0)) abort(422, 'Belum memenuhi minimal transaksi voucher.');
+
+        $discount = ($coupon['type'] ?? null) === 'percent'
+            ? (int) round($subtotal * (int) ($coupon['value'] ?? 0) / 100)
+            : (int) ($coupon['value'] ?? 0);
+        $discount = min($discount, $subtotal);
+        $amount = $subtotal - $discount;
+        if ($amount < 500) abort(422, 'Total setelah diskon minimal Rp500.');
+
+        return [$amount, $discount, $code];
+    }
+
+    private function redeemCoupon(PakasirTransaction $transaction): void
+    {
+        $customer = $transaction->customer_data ?? [];
+        $code = strtoupper(trim((string) ($customer['coupon_code'] ?? '')));
+        if ($code === '' || ($customer['coupon_redeemed'] ?? false)) return;
+
+        $redeemed = DB::transaction(function () use ($code): bool {
+            $state = StoreState::query()
+                ->lockForUpdate()
+                ->where('key', 'botakstore')
+                ->first();
+            if (! $state) return false;
+
+            $payload = $state->payload ?? [];
+            $redeemed = false;
+            $payload['coupons'] = collect($payload['coupons'] ?? [])->map(function (array $coupon) use ($code, &$redeemed): array {
+            if (! $redeemed
+                && strtoupper((string) ($coupon['code'] ?? '')) === $code
+                && ($coupon['active'] ?? false)
+                && (int) ($coupon['used'] ?? 0) < (int) ($coupon['quota'] ?? 0)) {
+                $coupon['used'] = (int) ($coupon['used'] ?? 0) + 1;
+                $redeemed = true;
+            }
+            return $coupon;
+            })->values()->all();
+            if (! $redeemed) return false;
+
+            $state->payload = $payload;
+            $state->save();
+            return true;
+        });
+        if (! $redeemed) return;
+
+        $customer['coupon_redeemed'] = true;
+        $transaction->customer_data = $customer;
+        $transaction->save();
+    }
+
+    private function resolveOrder(array $data, array $catalog): array
+    {
+        $game = collect($catalog['games'] ?? [])->first(
+            fn (array $item): bool => ($item['slug'] ?? null) === 'mobile-legends',
+        );
+        if (! $game) {
+            abort(503, 'Katalog Mobile Legends belum tersedia.');
+        }
+
+        if ($data['order_type'] === 'joki') {
+            $package = collect($catalog['jokiPackages'] ?? [])->first(fn (array $item): bool =>
+                (string) ($item['id'] ?? '') === (string) $data['item_id']
+                && ($item['gameSlug'] ?? null) === 'mobile-legends'
+                && ($item['status'] ?? 'inactive') === 'active',
+            );
+            if (! $package) {
+                abort(422, 'Paket joki tidak tersedia.');
+            }
+
+            $quantity = (int) ($data['customer']['quantity'] ?? 1);
+            $perStar = (bool) ($package['perStar'] ?? false);
+            $amount = (int) ($package['price'] ?? 0) * ($perStar ? $quantity : 1);
+            if ($amount < 500) {
+                abort(422, 'Harga paket joki tidak valid.');
+            }
+
+            return [
+                'item_id' => (string) $package['id'],
+                'description' => (string) ($package['name'] ?? 'Joki Mobile Legends'),
+                'amount' => $amount,
+                'game_id' => (string) ($game['id'] ?? 'g-mlbb'),
+                'game_name' => (string) ($game['name'] ?? 'Mobile Legends'),
+            ];
+        }
+
+        $production = filter_var(config('services.digiflazz.production'), FILTER_VALIDATE_BOOL);
+        $products = Cache::get('digiflazz:mobile-legends:v3:'.($production ? 'production' : 'development'));
+        if (! is_array($products) || $products === []) {
+            abort(503, 'Katalog Top Up sedang disiapkan. Silakan muat ulang beberapa saat lagi.');
+        }
+        $product = collect($products)->first(
+            fn (array $item): bool => (string) ($item['id'] ?? '') === (string) $data['item_id'],
+        );
+        if (! $product) {
+            abort(422, 'Produk Top Up tidak tersedia atau harga sudah berubah.');
+        }
+
+        $settings = $catalog['settings'] ?? [];
+        $markupPercent = max(0, (float) ($settings['topupMarkupPercent'] ?? 0));
+        $markupFlat = max(0, (int) ($settings['topupMarkupFlat'] ?? 0));
+        $amount = (int) round((int) $product['price'] * (1 + ($markupPercent / 100))) + $markupFlat;
+        if ($amount < 500) {
+            abort(422, 'Harga produk Top Up tidak valid.');
+        }
+
+        return [
+            'item_id' => (string) $product['id'],
+            'description' => 'Top Up Mobile Legends - '.(string) $product['label'],
+            'amount' => $amount,
+            'game_id' => (string) ($game['id'] ?? 'g-mlbb'),
+            'game_name' => (string) ($game['name'] ?? 'Mobile Legends'),
+        ];
+    }
+
+    private function optionalAuthenticatedUser(Request $request): ?User
+    {
+        $token = $request->bearerToken() ?: $request->cookie((string) config('jwt.cookie'));
+        if (! $token) return null;
+
+        try {
+            $payload = $this->jwt->decode($token);
+            return User::query()->find($payload['sub'] ?? null);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
