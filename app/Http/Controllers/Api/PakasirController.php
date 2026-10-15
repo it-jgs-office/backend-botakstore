@@ -8,6 +8,8 @@ use App\Models\StoreState;
 use App\Models\StoreOperationState;
 use App\Models\User;
 use App\Services\JwtService;
+use App\Services\JokiInvoiceService;
+use App\Services\QrisDynamicService;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -15,11 +17,27 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class PakasirController extends Controller
 {
-    public function __construct(private readonly JwtService $jwt) {}
+    public function __construct(
+        private readonly JwtService $jwt,
+        private readonly QrisDynamicService $qris,
+        private readonly JokiInvoiceService $jokiInvoices,
+    ) {}
+
+    public function createJokiQris(Request $request): JsonResponse
+    {
+        $request->merge([
+            'order_type' => 'joki',
+            'payment_method' => 'qris',
+        ]);
+
+        return $this->create($request);
+    }
 
     public function create(Request $request): JsonResponse
     {
@@ -56,12 +74,6 @@ class PakasirController extends Controller
             $data['customer']['password'] = Crypt::encryptString((string) $data['customer']['password']);
         }
 
-        $slug = (string) config('services.pakasir.slug');
-        $apiKey = (string) config('services.pakasir.api_key');
-        if ($slug === '' || $apiKey === '') {
-            return response()->json(['message' => 'Konfigurasi Pakasir belum lengkap.'], 503);
-        }
-
         $catalog = StoreState::query()->where('key', 'botakstore')->first();
         $catalogPayload = $catalog?->payload ?? [];
         if (($catalogPayload['settings']['maintenance'] ?? false) === true) {
@@ -92,6 +104,25 @@ class PakasirController extends Controller
         $data['customer']['coupon_discount'] = $discount;
         $data['customer']['coupon_base_amount'] = $baseAmount;
 
+        $isDynamicJokiQris = $data['order_type'] === 'joki';
+        $dynamicQris = null;
+        $serviceFee = 0;
+        $totalPayment = $amount;
+        if ($isDynamicJokiQris) {
+            $data['payment_method'] = 'qris';
+            $this->jokiInvoices->removeExpired();
+            $serviceFee = $this->allocateJokiPaymentCode($amount);
+            $totalPayment = $amount + $serviceFee;
+            try {
+                $dynamicQris = $this->qris->convert(
+                    (string) ($catalogPayload['settings']['jokiQrisPayload'] ?? ''),
+                    $totalPayment,
+                );
+            } catch (\InvalidArgumentException $exception) {
+                return response()->json(['message' => 'QRIS joki belum siap: '.$exception->getMessage()], 422);
+            }
+        }
+
         $orderId = sprintf(
             'BS-%s-%s-%s',
             strtoupper($data['order_type']),
@@ -104,12 +135,66 @@ class PakasirController extends Controller
             'order_type' => $data['order_type'],
             'item_id' => $data['item_id'],
             'description' => $data['description'],
-            'amount' => $amount,
+            'amount' => $isDynamicJokiQris ? $totalPayment : $amount,
             'payment_method' => $data['payment_method'],
             'status' => 'pending',
-            'is_sandbox' => filter_var(config('services.pakasir.sandbox'), FILTER_VALIDATE_BOOL),
+            'is_sandbox' => $isDynamicJokiQris
+                ? false
+                : filter_var(config('services.pakasir.sandbox'), FILTER_VALIDATE_BOOL),
             'customer_data' => $data['customer'],
         ]);
+
+        if ($isDynamicJokiQris && $dynamicQris !== null) {
+            $txnId = 'JQR-'.Str::upper(Str::random(16));
+            $expiresAt = $transaction->created_at->copy()->addMinutes(5)->toISOString();
+            $payload = [
+                'provider' => 'joki_dynamic_qris',
+                'qr_string' => $dynamicQris,
+                'total_payment' => $totalPayment,
+                'fee' => $serviceFee,
+                'expired_at' => $expiresAt,
+            ];
+            $transaction->update([
+                'txn_id' => $txnId,
+                'provider_payload' => $payload,
+            ]);
+            $this->storePendingOrder(
+                $data,
+                $orderId,
+                $txnId,
+                $totalPayment,
+                $baseAmount,
+                $discount,
+                $couponCode,
+            );
+
+            return response()->json([
+                'data' => [
+                    'order_id' => $orderId,
+                    'txn_id' => $txnId,
+                    'amount' => $totalPayment,
+                    'base_amount' => $baseAmount,
+                    'discount' => $discount,
+                    'coupon_code' => $couponCode,
+                    'payment_method' => 'qris',
+                    'fee' => $serviceFee,
+                    'total_payment' => $totalPayment,
+                    'expired_at' => $expiresAt,
+                    'qr_string' => $dynamicQris,
+                    'va_number' => null,
+                    'payment_url' => null,
+                    'is_sandbox' => $transaction->is_sandbox,
+                    'is_dynamic_qris' => true,
+                ],
+            ], 201);
+        }
+
+        $slug = (string) config('services.pakasir.slug');
+        $apiKey = (string) config('services.pakasir.api_key');
+        if ($slug === '' || $apiKey === '') {
+            $transaction->update(['status' => 'failed']);
+            return response()->json(['message' => 'Konfigurasi Pakasir belum lengkap.'], 503);
+        }
 
         try {
             $response = Http::acceptJson()
@@ -187,6 +272,7 @@ class PakasirController extends Controller
                 'va_number' => $vaNumber !== '' ? $vaNumber : null,
                 'payment_url' => $paymentUrl,
                 'is_sandbox' => filter_var(config('services.pakasir.sandbox'), FILTER_VALIDATE_BOOL),
+                'is_dynamic_qris' => false,
             ],
         ], 201);
     }
@@ -199,7 +285,19 @@ class PakasirController extends Controller
             return response()->json(['message' => 'Invoice tidak ditemukan.'], 404);
         }
 
-        if ($request->boolean('refresh') && $transaction->status === 'pending') {
+        if (($transaction->provider_payload['provider'] ?? null) === 'joki_dynamic_qris') {
+            if ($this->jokiInvoices->removePending($orderId, true) === 'removed') {
+                return response()->json(['message' => 'Batas pembayaran 5 menit telah habis. Invoice otomatis dihapus.'], 410);
+            }
+            $transaction = PakasirTransaction::query()->where('order_id', $orderId)->first();
+            if (! $transaction) {
+                return response()->json(['message' => 'Invoice tidak ditemukan.'], 404);
+            }
+        }
+
+        if ($request->boolean('refresh')
+            && $transaction->status === 'pending'
+            && (($transaction->provider_payload['provider'] ?? null) !== 'joki_dynamic_qris')) {
             $slug = (string) config('services.pakasir.slug');
             $apiKey = (string) config('services.pakasir.api_key');
 
@@ -256,17 +354,180 @@ class PakasirController extends Controller
                 'payment_method' => $transaction->payment_method,
                 'status' => $transaction->status,
                 'created_at' => $transaction->created_at?->toISOString(),
-                'expired_at' => $payload['expired_at'] ?? null,
+                'expired_at' => ($payload['payment_proof']['status'] ?? null) !== null
+                    ? null
+                    : (($payload['provider'] ?? null) === 'joki_dynamic_qris'
+                        ? $this->jokiInvoices->expiresAt($transaction)->toISOString()
+                        : ($payload['expired_at'] ?? null)),
                 'qr_string' => $payload['qr_string'] ?? null,
                 'va_number' => $payload['va_number'] ?? null,
                 'payment_url' => $payload['payment_link'] ?? null,
                 'is_sandbox' => $transaction->is_sandbox,
+                'is_dynamic_qris' => ($payload['provider'] ?? null) === 'joki_dynamic_qris',
+                'payment_proof_status' => $payload['payment_proof']['status'] ?? null,
+                'payment_proof_uploaded_at' => $payload['payment_proof']['uploaded_at'] ?? null,
                 'game_name' => $customer['game_name'] ?? null,
                 'game_user_id' => $customer['user_id'] ?? null,
                 'game_server_id' => $customer['server_id'] ?? null,
                 'quantity' => $customer['quantity'] ?? null,
             ],
         ]);
+    }
+
+    public function uploadJokiPaymentProof(Request $request, string $orderId): JsonResponse
+    {
+        $validated = $request->validate([
+            'proof' => ['required', 'image', 'mimes:webp', 'max:5120'],
+        ]);
+        if ($this->jokiInvoices->removePending($orderId, true) === 'removed') {
+            return response()->json(['message' => 'Batas pembayaran 5 menit telah habis. Invoice otomatis dihapus.'], 410);
+        }
+        return DB::transaction(function () use ($validated, $orderId): JsonResponse {
+            $transaction = PakasirTransaction::query()
+                ->where('order_id', $orderId)
+                ->where('order_type', 'joki')
+                ->lockForUpdate()
+                ->first();
+
+            if (! $transaction || ($transaction->provider_payload['provider'] ?? null) !== 'joki_dynamic_qris') {
+                return response()->json(['message' => 'Invoice joki tidak ditemukan.'], 404);
+            }
+            if ($transaction->status !== 'pending') {
+                return response()->json(['message' => 'Bukti pembayaran tidak dapat diunggah untuk invoice ini.'], 422);
+            }
+            if (($transaction->provider_payload['payment_proof']['status'] ?? null) === 'submitted') {
+                return response()->json(['message' => 'Bukti pembayaran sudah dikirim dan sedang menunggu konfirmasi admin.'], 422);
+            }
+            if ($this->jokiInvoices->isExpired($transaction)) {
+                $this->jokiInvoices->removePending($orderId, true);
+                return response()->json(['message' => 'Batas pembayaran 5 menit telah habis. Invoice otomatis dihapus.'], 410);
+            }
+
+            $directory = public_path('uploads/botakstore/payment-proofs');
+            if (! is_dir($directory)) mkdir($directory, 0755, true);
+            $file = $validated['proof'];
+            $filename = Str::uuid().'.'.$file->guessExtension();
+            $file->move($directory, $filename);
+
+            $payload = array_merge($transaction->provider_payload ?? [], [
+                'payment_proof' => [
+                    'status' => 'submitted',
+                    'url' => url('/uploads/botakstore/payment-proofs/'.$filename),
+                    'uploaded_at' => now()->toISOString(),
+                ],
+            ]);
+            $transaction->update(['provider_payload' => $payload]);
+            $this->markJokiProofSubmitted($transaction);
+
+            return response()->json([
+                'message' => 'Bukti pembayaran diterima. Menunggu konfirmasi admin.',
+                'data' => [
+                    'order_id' => $transaction->order_id,
+                    'status' => 'waiting_confirmation',
+                    'uploaded_at' => $payload['payment_proof']['uploaded_at'],
+                ],
+            ], 201);
+        });
+    }
+
+    public function cancelJokiInvoice(string $orderId): JsonResponse
+    {
+        $result = $this->jokiInvoices->removePending($orderId);
+
+        return match ($result) {
+            'removed' => response()->json(['message' => 'Invoice berhasil dibatalkan dan dihapus.']),
+            'not_allowed' => response()->json(['message' => 'Invoice yang sudah mengirim bukti pembayaran tidak dapat dibatalkan.'], 422),
+            default => response()->json(['message' => 'Invoice tidak ditemukan.'], 404),
+        };
+    }
+
+    public function jokiPaymentProofs(): JsonResponse
+    {
+        $proofs = PakasirTransaction::query()
+            ->where('order_type', 'joki')
+            ->where('status', 'pending')
+            ->latest('updated_at')
+            ->get()
+            ->filter(fn (PakasirTransaction $transaction): bool => ($transaction->provider_payload['payment_proof']['status'] ?? null) === 'submitted')
+            ->map(function (PakasirTransaction $transaction): array {
+                $payload = $transaction->provider_payload ?? [];
+                $customer = $transaction->customer_data ?? [];
+
+                return [
+                    'order_id' => $transaction->order_id,
+                    'txn_id' => $transaction->txn_id,
+                    'description' => $transaction->description,
+                    'amount' => $transaction->amount,
+                    'fee' => (int) ($payload['fee'] ?? 0),
+                    'total_payment' => (int) ($payload['total_payment'] ?? $transaction->amount),
+                    'customer_name' => $customer['customer_name'] ?? $customer['username'] ?? $customer['nickname'] ?? 'Pelanggan',
+                    'customer_phone' => $customer['whatsapp'] ?? '',
+                    'proof_url' => $payload['payment_proof']['url'],
+                    'uploaded_at' => $payload['payment_proof']['uploaded_at'],
+                ];
+            })
+            ->values();
+
+        return response()->json(['data' => $proofs]);
+    }
+
+    public function confirmJokiPayment(Request $request, string $orderId): JsonResponse
+    {
+        $transaction = PakasirTransaction::query()
+            ->where('order_id', $orderId)
+            ->where('order_type', 'joki')
+            ->first();
+
+        if (! $transaction || ($transaction->provider_payload['provider'] ?? null) !== 'joki_dynamic_qris') {
+            return response()->json(['message' => 'Invoice joki tidak ditemukan.'], 404);
+        }
+        if ($transaction->status !== 'pending') {
+            return response()->json(['message' => 'Pembayaran invoice ini sudah diproses.'], 422);
+        }
+        if (($transaction->provider_payload['payment_proof']['status'] ?? null) !== 'submitted') {
+            return response()->json(['message' => 'Bukti pembayaran belum diunggah pelanggan.'], 422);
+        }
+
+        $proofUrl = (string) ($transaction->provider_payload['payment_proof']['url'] ?? '');
+        DB::transaction(function () use ($transaction, $request): void {
+            $transaction->update([
+                'status' => 'completed',
+                'completed_at' => now(),
+                'provider_payload' => array_merge($transaction->provider_payload ?? [], [
+                    'payment_proof' => array_merge($transaction->provider_payload['payment_proof'] ?? [], [
+                        'status' => 'confirmed',
+                        'confirmed_at' => now()->toISOString(),
+                        'confirmed_by' => $request->user()->id,
+                    ]),
+                ]),
+            ]);
+            $this->syncOrderPaymentStatus($transaction, 'completed');
+        });
+
+        $proofPath = (string) parse_url($proofUrl, PHP_URL_PATH);
+        $photoDeleted = false;
+        if (preg_match('~(?:^|/)uploads/botakstore/payment-proofs/([0-9a-f-]{36}\.webp)$~i', $proofPath, $matches)) {
+            $filePath = public_path('uploads/botakstore/payment-proofs/'.$matches[1]);
+            try {
+                $photoDeleted = ! File::exists($filePath) || File::delete($filePath);
+            } catch (\Throwable $exception) {
+                Log::warning('Bukti pembayaran joki gagal dihapus.', [
+                    'order_id' => $orderId,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        if ($photoDeleted) {
+            $payload = $transaction->provider_payload ?? [];
+            $payload['payment_proof']['url'] = null;
+            $payload['payment_proof']['deleted_at'] = now()->toISOString();
+            $transaction->update(['provider_payload' => $payload]);
+        }
+
+        return response()->json(['message' => $photoDeleted
+            ? 'Pembayaran dikonfirmasi. Foto bukti transfer dihapus dan pesanan joki sedang diproses.'
+            : 'Pembayaran dikonfirmasi dan pesanan joki sedang diproses, tetapi foto bukti transfer belum berhasil dihapus.']);
     }
 
     public function webhook(Request $request): JsonResponse
@@ -323,6 +584,11 @@ class PakasirController extends Controller
 
         if (! $transaction) {
             return response()->json(['message' => 'Invoice tidak ditemukan.'], 404);
+        }
+
+        if ($transaction->order_type === 'joki'
+            || ($transaction->provider_payload['provider'] ?? null) === 'joki_dynamic_qris') {
+            return response()->json(['message' => 'Pembayaran joki dikonfirmasi manual oleh admin.'], 403);
         }
 
         if (! $transaction->is_sandbox) {
@@ -428,6 +694,38 @@ class PakasirController extends Controller
             $payload['orders'] = $orders;
             $payload['payments'] = $payments;
             $payload['logs'] = $logs;
+            $state->payload = $payload;
+            $state->save();
+        });
+    }
+
+    private function markJokiProofSubmitted(PakasirTransaction $transaction): void
+    {
+        DB::transaction(function () use ($transaction): void {
+            $state = StoreOperationState::query()
+                ->lockForUpdate()
+                ->where('key', 'botakstore')
+                ->first();
+            if (! $state) return;
+
+            $payload = $state->payload ?? [];
+            $now = now()->toISOString();
+            $payload['orders'] = collect($payload['orders'] ?? [])->map(function (array $order) use ($transaction, $now): array {
+                if (($order['id'] ?? null) !== $transaction->order_id) return $order;
+
+                return [...$order, 'status' => 'waiting_confirmation', 'updatedAt' => $now];
+            })->values()->all();
+            $payload['logs'] = [
+                [
+                    'id' => 'log-proof-'.$transaction->order_id,
+                    'orderId' => $transaction->order_id,
+                    'status' => 'waiting_confirmation',
+                    'message' => 'Bukti pembayaran diunggah. Menunggu konfirmasi admin.',
+                    'by' => 'customer',
+                    'createdAt' => $now,
+                ],
+                ...($payload['logs'] ?? []),
+            ];
             $state->payload = $payload;
             $state->save();
         });
@@ -602,5 +900,24 @@ class PakasirController extends Controller
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    private function allocateJokiPaymentCode(int $subtotal): int
+    {
+        $usedAmounts = PakasirTransaction::query()
+            ->where('order_type', 'joki')
+            ->where('status', 'pending')
+            ->pluck('amount')
+            ->map(fn (int $amount): int => $amount)
+            ->flip();
+        $start = random_int(1, 999);
+
+        for ($offset = 0; $offset < 999; $offset++) {
+            $fee = (($start + $offset - 1) % 999) + 1;
+            if (! $usedAmounts->has($subtotal + $fee)) return $fee;
+        }
+
+        // Sangat jarang terjadi; tetap gunakan rentang berbeda agar nominal tidak sama.
+        return random_int(1000, 9999);
     }
 }

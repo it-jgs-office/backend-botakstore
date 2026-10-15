@@ -25,6 +25,7 @@ class AuthController extends Controller
             'email' => ['required', 'email'],
             'password' => ['required', 'string'],
             'recaptcha_token' => ['required', 'string', 'min:10'],
+            'remember_browser' => ['nullable', 'boolean'],
         ], [
             'recaptcha_token.required' => 'Mohon centang verifikasi captcha terlebih dahulu.',
         ]);
@@ -38,7 +39,7 @@ class AuthController extends Controller
             ]);
         }
 
-        return $this->tokenResponse($user);
+        return $this->tokenResponse($user, 200, $request->boolean('remember_browser'));
     }
 
     public function register(Request $request): JsonResponse
@@ -156,8 +157,11 @@ class AuthController extends Controller
         }
     }
 
-    private function tokenResponse(User $user, int $status = 200): JsonResponse    {
-        $issued = $this->jwt->issue($user);
+    private function tokenResponse(User $user, int $status = 200, bool $rememberBrowser = false): JsonResponse    {
+        $ttl = $rememberBrowser
+            ? (int) config('jwt.remember_ttl')
+            : (int) config('jwt.ttl');
+        $issued = $this->jwt->issue($user, $ttl);
 
         return response()->json([
             'token_type' => 'Bearer',

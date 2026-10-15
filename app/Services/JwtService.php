@@ -8,10 +8,10 @@ use Illuminate\Support\Str;
 
 class JwtService
 {
-    public function issue(User $user): array
+    public function issue(User $user, ?int $ttlMinutes = null): array
     {
         $issuedAt = now()->timestamp;
-        $expiresAt = now()->addMinutes((int) config('jwt.ttl'))->timestamp;
+        $expiresAt = now()->addMinutes($ttlMinutes ?? (int) config('jwt.ttl'))->timestamp;
         $payload = [
             'iss' => config('jwt.issuer'),
             'sub' => (string) $user->getKey(),

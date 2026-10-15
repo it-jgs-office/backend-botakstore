@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\AdminStateController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\DigiflazzProductController;
+use App\Http\Controllers\Api\JokiQrisController;
 use App\Http\Controllers\Api\MobileLegendsController;
 use App\Http\Controllers\Api\PakasirController;
 use App\Http\Controllers\Api\UploadController;
@@ -34,6 +35,14 @@ Route::post('/game/mobile-legends/check', [MobileLegendsController::class, 'chec
     ->middleware('throttle:account-check');
 Route::post('/payments/pakasir/create', [PakasirController::class, 'create'])
     ->middleware('throttle:payment-create');
+Route::post('/payments/joki/qris/create', [PakasirController::class, 'createJokiQris'])
+    ->middleware('throttle:payment-create');
+Route::post('/payments/joki/{orderId}/proof', [PakasirController::class, 'uploadJokiPaymentProof'])
+    ->where('orderId', '[A-Za-z0-9-]{1,100}')
+    ->middleware('throttle:payment-create');
+Route::post('/payments/joki/{orderId}/cancel', [PakasirController::class, 'cancelJokiInvoice'])
+    ->where('orderId', '[A-Za-z0-9-]{1,100}')
+    ->middleware('throttle:payment-create');
 Route::post('/payments/pakasir/{orderId}/simulate', [PakasirController::class, 'simulate'])
     ->where('orderId', '[A-Za-z0-9-]{1,100}')
     ->middleware('throttle:payment-create');
@@ -44,6 +53,11 @@ Route::post('/payments/pakasir/webhook', [PakasirController::class, 'webhook'])
     ->middleware('throttle:webhook');
 
 Route::prefix('admin')->middleware(['jwt.auth', 'admin', 'throttle:admin-api'])->group(function (): void {
+    Route::get('/joki/payment-proofs', [PakasirController::class, 'jokiPaymentProofs']);
+    Route::post('/joki/{orderId}/confirm-payment', [PakasirController::class, 'confirmJokiPayment'])
+        ->where('orderId', '[A-Za-z0-9-]{1,100}');
+    Route::post('/joki-qris/validate', [JokiQrisController::class, 'validateTemplate'])
+        ->middleware('throttle:10,1');
     Route::post('/digiflazz/sync', [DigiflazzProductController::class, 'sync'])
         ->middleware('throttle:10,1');
     Route::post('/uploads', [UploadController::class, 'store'])->middleware('throttle:10,1');

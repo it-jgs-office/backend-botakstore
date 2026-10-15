@@ -6,15 +6,23 @@ use App\Http\Controllers\Controller;
 use App\Models\StoreState;
 use App\Models\StoreOperationState;
 use App\Models\User;
+use App\Services\JokiInvoiceService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class AdminStateController extends Controller
 {
+    public function __construct(private readonly JokiInvoiceService $jokiInvoices) {}
+
     public function publicState(): JsonResponse
     {
         $state = StoreState::query()->where('key', 'botakstore')->first();
-        $payload = $this->sanitizeCatalogPayload($state?->payload ?? []);
+        $rawPayload = $state?->payload ?? [];
+        $payload = $this->sanitizeCatalogPayload($rawPayload);
+        $payload['settings'] = array_intersect_key($payload['settings'] ?? [], array_flip([
+            'storeName', 'whatsapp', 'maintenance', 'topupMarkupPercent', 'topupMarkupFlat',
+        ]));
+        $payload['settings']['jokiQrisReady'] = filled($rawPayload['settings']['jokiQrisPayload'] ?? null);
 
         return response()->json([
             'data' => array_intersect_key($payload, array_flip([
@@ -30,6 +38,7 @@ class AdminStateController extends Controller
 
     public function publicOrder(string $orderId): JsonResponse
     {
+        $this->jokiInvoices->removePending($orderId, true);
         $state = StoreOperationState::query()->where('key', 'botakstore')->first();
         $payload = $this->sanitizeOperations($state?->payload ?? []);
         $order = collect($payload['orders'] ?? [])
@@ -45,6 +54,7 @@ class AdminStateController extends Controller
 
     public function recentOrders(): JsonResponse
     {
+        $this->jokiInvoices->removeExpired();
         $state = StoreOperationState::query()->where('key', 'botakstore')->first();
         $payload = $this->sanitizeOperations($state?->payload ?? []);
         $orders = collect($payload['orders'] ?? [])
@@ -58,6 +68,7 @@ class AdminStateController extends Controller
 
     public function customerData(Request $request): JsonResponse
     {
+        $this->jokiInvoices->removeExpired();
         $state = StoreOperationState::query()->where('key', 'botakstore')->first();
         $payload = $this->sanitizeOperations($state?->payload ?? []);
         $customerId = "api-{$request->user()->id}";
@@ -125,6 +136,7 @@ class AdminStateController extends Controller
 
     public function operations(): JsonResponse
     {
+        $this->jokiInvoices->removeExpired();
         $state = StoreOperationState::query()->where('key', 'botakstore')->first();
 
         return response()->json([

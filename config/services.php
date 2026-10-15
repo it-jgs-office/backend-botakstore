@@ -54,7 +54,7 @@ return [
         'webhook_secret' => env('PAKASIR_WEBHOOK_SECRET'),
         'sandbox' => env('PAKASIR_SANDBOX', true),
         'base_url' => env('PAKASIR_BASE_URL', 'https://app.pakasir.com'),
-        'redirect_url' => env('PAKASIR_REDIRECT_URL', 'http://localhost:8080/invoice'),
+        'redirect_url' => env('PAKASIR_REDIRECT_URL', 'https://botakstore.id/cek-order'),
     ],
 
     'recaptcha' => [
